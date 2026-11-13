@@ -1,0 +1,22 @@
+Subject: [PATCH] sched/fair: optionally lower promotion headroom
+
+Base: upstream Linux v6.12. This changes the underlying tiering policy and
+is not required by Koseishugi Algorithms 1 or 2. Apply consistently to
+baseline and treatment if reproducing an experiment with this tuning.
+
+---
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1814,8 +1814,9 @@
+ 	int z;
+ 	unsigned long enough_wmark;
+ 
+-	enough_wmark = max(1UL * 1024 * 1024 * 1024 >> PAGE_SHIFT,
+-			   pgdat->node_present_pages >> 4);
++	/* Optional experiment tuning: smaller promotion headroom. */
++	enough_wmark = max(64UL * 1024 * 1024 >> PAGE_SHIFT,
++			   pgdat->node_present_pages >> 8);
+ 	for (z = pgdat->nr_zones - 1; z >= 0; z--) {
+ 		struct zone *zone = pgdat->node_zones + z;
+ 

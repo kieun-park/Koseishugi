@@ -1,0 +1,22 @@
+experiment_tag: socialnet_run001
+
+agent_tick_ms: 2000
+network_interface: lo
+p0_burst_threshold_kib: 10000.0
+p0_idle_threshold_ticks: 9   # Idle RX or no qualifying service backlog.
+p0_idle_trim_pct: 20        # Evict this fraction of oldest entries, then disable gating.
+
+p1_recvq_threshold_kib: 1.0
+p1_exclude_services: [nginx, frontend, jaeger, storage]
+
+p2_perf_event_config: 0x20d1
+p2_sample_period: 1000       # Selected PMU events per sample.
+p2_sampling_window_ms: 30000
+p2_ring_pages: 256           # Perf data pages per CPU; power of two.
+p2_histogram_path: /proc/pebs_page_hist
+p2_cgroup_resolve: auto      # auto | systemd | proc
+p2_cooldown_ms: 0            # Optional pause; 0 follows Algorithm 1.
+
+p3_pfn_hist_max: 65536       # Per-update page limit; strictly below kernel capacity.
+p3_pfn_percentile: 80        # Cumulative access coverage (%).
+histogram_logging: false    # Optional per-window PFN .log files.

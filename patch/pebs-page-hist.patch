@@ -1,0 +1,326 @@
+Subject: [PATCH] kernel: add the Koseishugi working-set interface
+
+Base: upstream Linux v6.12, native x86-64 only. Syscalls 463-465 are
+private to this kernel; verify the procfs ABI marker before invoking them.
+Merge, aging, gate state and queries share one lock. Procfs uses
+a snapshot.
+Updates require CAP_SYS_ADMIN and never initiate migration.
+
+---
+diff --git a/include/linux/pebs_page_hist.h b/include/linux/pebs_page_hist.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/pebs_page_hist.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _PEBS_PAGE_HIST_H
++#define _PEBS_PAGE_HIST_H
++
++#include <linux/types.h>
++
++/* Each query observes the gate and membership under the same read lock. */
++bool pebs_promotion_blocked(unsigned long pfn);
++bool pebs_demotion_blocked(unsigned long pfn);
++
++#endif /* _PEBS_PAGE_HIST_H */
+diff --git a/kernel/pebs_page_hist.c b/kernel/pebs_page_hist.c
+new file mode 100644
+--- /dev/null
++++ b/kernel/pebs_page_hist.c
+@@ -0,0 +1,272 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Koseishugi: bounded, submission-recency working set for Linux v6.12.
++ * PFNs are submitted cold to hot. Updating this set does not move pages.
++ * The userspace controller disables both gates when it ages the set.
++ */
++#include <linux/capability.h>
++#include <linux/export.h>
++#include <linux/hashtable.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/pebs_page_hist.h>
++#include <linux/proc_fs.h>
++#include <linux/rwlock.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/syscalls.h>
++#include <linux/uaccess.h>
++#include <linux/vmalloc.h>
++
++#define PFN_HASH_BITS 18
++#define PFN_HIST_MAX 262144
++
++struct hot_page {
++	unsigned long pfn;
++	struct hlist_node hash_node;
++	struct list_head lru_node;
++};
++
++static DEFINE_HASHTABLE(heat_map, PFN_HASH_BITS);
++static LIST_HEAD(lru_list);
++static DEFINE_RWLOCK(heat_map_lock);
++/* All state below is protected by heat_map_lock, including the gate. */
++static unsigned int n_tracked;
++static bool gate_active;
++
++static bool pfn_hot_locked(unsigned long pfn)
++{
++	struct hot_page *entry;
++
++	hash_for_each_possible(heat_map, entry, hash_node, pfn) {
++		if (entry->pfn == pfn)
++			return true;
++	}
++	return false;
++}
++
++static bool pebs_gate_blocks(unsigned long pfn, bool promotion)
++{
++	unsigned long flags;
++	bool blocked;
++
++	read_lock_irqsave(&heat_map_lock, flags);
++	blocked = gate_active && (pfn_hot_locked(pfn) != promotion);
++	read_unlock_irqrestore(&heat_map_lock, flags);
++	return blocked;
++}
++
++bool pebs_promotion_blocked(unsigned long pfn)
++{
++	return pebs_gate_blocks(pfn, true);
++}
++EXPORT_SYMBOL_GPL(pebs_promotion_blocked);
++
++bool pebs_demotion_blocked(unsigned long pfn)
++{
++	return pebs_gate_blocks(pfn, false);
++}
++EXPORT_SYMBOL_GPL(pebs_demotion_blocked);
++
++/* Caller holds write lock; free detached entries after releasing it. */
++static void detach_entry(struct hot_page *entry, struct list_head *to_free)
++{
++	hash_del(&entry->hash_node);
++	list_move_tail(&entry->lru_node, to_free);
++	n_tracked--;
++}
++
++static void free_entries(struct list_head *entries)
++{
++	struct hot_page *entry, *tmp;
++
++	list_for_each_entry_safe(entry, tmp, entries, lru_node)
++		kfree(entry);
++}
++
++/*
++ * Native x86-64 ABI: pebs_submit(unsigned long *pfns, int n).
++ * A successful nonempty merge activates the gate atomically with the set.
++ * Empty submissions are no-ops, including when the gate is inactive.
++ */
++SYSCALL_DEFINE2(pebs_submit, unsigned long __user *, pfns, int, n)
++{
++	unsigned long *kpfns, flags;
++	struct hot_page **new_entries;
++	LIST_HEAD(to_free);
++	int i, j, ret = 0;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	/* Algorithm 1 requires each update's page limit below capacity. */
++	if (n < 0 || n >= PFN_HIST_MAX)
++		return -EINVAL;
++	if (!n)
++		return 0;
++	if (!pfns)
++		return -EINVAL;
++
++	kpfns = kvmalloc_array(n, sizeof(*kpfns), GFP_KERNEL);
++	if (!kpfns)
++		return -ENOMEM;
++	if (copy_from_user(kpfns, pfns, (size_t)n * sizeof(*kpfns))) {
++		ret = -EFAULT;
++		goto out_free_pfns;
++	}
++	new_entries = kvmalloc_array(n, sizeof(*new_entries), GFP_KERNEL);
++	if (!new_entries) {
++		ret = -ENOMEM;
++		goto out_free_pfns;
++	}
++	/* Allocation must not recurse into reclaim while holding our lock. */
++	for (i = 0; i < n; i++) {
++		new_entries[i] = kzalloc(sizeof(*new_entries[i]), GFP_KERNEL);
++		if (!new_entries[i]) {
++			for (j = 0; j < i; j++)
++				kfree(new_entries[j]);
++			kvfree(new_entries);
++			ret = -ENOMEM;
++			goto out_free_pfns;
++		}
++		new_entries[i]->pfn = kpfns[i];
++	}
++
++	write_lock_irqsave(&heat_map_lock, flags);
++	for (i = 0; i < n; i++) {
++		struct hot_page *entry;
++
++		hash_for_each_possible(heat_map, entry, hash_node, kpfns[i]) {
++			if (entry->pfn == kpfns[i]) {
++				detach_entry(entry, &to_free);
++				break;
++			}
++		}
++		if (n_tracked == PFN_HIST_MAX) {
++			entry = list_first_entry(&lru_list, struct hot_page,
++						 lru_node);
++			detach_entry(entry, &to_free);
++		}
++		entry = new_entries[i];
++		hash_add(heat_map, &entry->hash_node, entry->pfn);
++		list_add_tail(&entry->lru_node, &lru_list);
++		n_tracked++;
++	}
++	gate_active = true;
++	write_unlock_irqrestore(&heat_map_lock, flags);
++	free_entries(&to_free);
++	kvfree(new_entries);
++out_free_pfns:
++	kvfree(kpfns);
++	return ret;
++}
++
++SYSCALL_DEFINE0(pebs_clear)
++{
++	LIST_HEAD(to_free);
++	struct hot_page *entry, *tmp;
++	unsigned long flags;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	write_lock_irqsave(&heat_map_lock, flags);
++	list_for_each_entry_safe(entry, tmp, &lru_list, lru_node)
++		detach_entry(entry, &to_free);
++	gate_active = false;
++	write_unlock_irqrestore(&heat_map_lock, flags);
++	free_entries(&to_free);
++	return 0;
++}
++
++/* Evict ceil(pct * count / 100) least recently submitted entries. */
++SYSCALL_DEFINE1(pebs_trim_cold, int, pct)
++{
++	LIST_HEAD(to_free);
++	unsigned long flags;
++	unsigned int to_evict;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	if (pct <= 0 || pct > 100)
++		return -EINVAL;
++	write_lock_irqsave(&heat_map_lock, flags);
++	to_evict = (n_tracked * pct + 99) / 100;
++	while (to_evict--) {
++		struct hot_page *entry = list_first_entry(&lru_list,
++							struct hot_page, lru_node);
++
++		detach_entry(entry, &to_free);
++	}
++	gate_active = false;
++	write_unlock_irqrestore(&heat_map_lock, flags);
++	free_entries(&to_free);
++	return 0;
++}
++
++struct pebs_snapshot {
++	unsigned int count;
++	bool gate;
++	unsigned long pfns[];
++};
++
++static int pebs_proc_show(struct seq_file *m, void *v)
++{
++	struct pebs_snapshot *snapshot = m->private;
++	unsigned int i;
++
++	seq_puts(m, "# Koseishugi_abi=1 submit=463 clear=464 trim=465 ");
++	seq_printf(m, "capacity=%u gate=%u pages=%u\n", PFN_HIST_MAX,
++		   snapshot->gate, snapshot->count);
++	for (i = 0; i < snapshot->count; i++)
++		seq_printf(m, "%lu\n", snapshot->pfns[i]);
++	return 0;
++}
++
++static int pebs_proc_open(struct inode *inode, struct file *file)
++{
++	struct pebs_snapshot *snapshot;
++	struct hot_page *entry;
++	unsigned long flags;
++	int ret;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	snapshot = kvzalloc(struct_size(snapshot, pfns, PFN_HIST_MAX), GFP_KERNEL);
++	if (!snapshot)
++		return -ENOMEM;
++	/* Snapshot once per open; never format procfs output under the lock. */
++	read_lock_irqsave(&heat_map_lock, flags);
++	snapshot->gate = gate_active;
++	list_for_each_entry_reverse(entry, &lru_list, lru_node)
++		snapshot->pfns[snapshot->count++] = entry->pfn;
++	read_unlock_irqrestore(&heat_map_lock, flags);
++	ret = single_open(file, pebs_proc_show, snapshot);
++	if (ret)
++		kvfree(snapshot);
++	return ret;
++}
++
++static int pebs_proc_release(struct inode *inode, struct file *file)
++{
++	struct seq_file *seq = file->private_data;
++	struct pebs_snapshot *snapshot = seq->private;
++	int ret = single_release(inode, file);
++
++	kvfree(snapshot);
++	return ret;
++}
++
++static const struct proc_ops pebs_proc_ops = {
++	.proc_open = pebs_proc_open,
++	.proc_read = seq_read,
++	.proc_lseek = seq_lseek,
++	.proc_release = pebs_proc_release,
++};
++
++static int __init pebs_page_hist_init(void)
++{
++	if (!proc_create("pebs_page_hist", 0400, NULL, &pebs_proc_ops))
++		return -ENOMEM;
++	return 0;
++}
++late_initcall(pebs_page_hist_init);
+diff --git a/kernel/Makefile b/kernel/Makefile
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -12,6 +12,7 @@
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+ 	    async.o range.o smpboot.o ucount.o regset.o ksyms_common.o
+ 
++obj-y += pebs_page_hist.o
+ obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
+ obj-$(CONFIG_MULTIUSER) += groups.o
+ obj-$(CONFIG_VHOST_TASK) += vhost_task.o
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -386,6 +386,9 @@
+ 460	common	lsm_set_self_attr	sys_lsm_set_self_attr
+ 461	common	lsm_list_modules	sys_lsm_list_modules
+ 462 	common  mseal			sys_mseal
++463	64	pebs_submit		sys_pebs_submit
++464	64	pebs_clear		sys_pebs_clear
++465	64	pebs_trim_cold		sys_pebs_trim_cold
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently

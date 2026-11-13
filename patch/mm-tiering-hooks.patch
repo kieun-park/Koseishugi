@@ -1,0 +1,52 @@
+Subject: [PATCH] mm: gate base-page promotion and demotion
+
+Base: upstream Linux v6.12, after pebs-page-hist.patch.
+Match Algorithm 2: inactive gates preserve the existing tiering behavior.
+Large folios bypass these base-page hooks. No migration is requested here.
+
+---
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -43,6 +43,7 @@
+ #include <linux/delayacct.h>
+ #include <linux/sysctl.h>
+ #include <linux/memory-tiers.h>
++#include <linux/pebs_page_hist.h>
+ #include <linux/oom.h>
+ #include <linux/pagevec.h>
+ #include <linux/prefetch.h>
+@@ -1215,6 +1216,10 @@
+ 		 */
+ 		if (do_demote_pass &&
+ 		    (thp_migration_supported() || !folio_test_large(folio))) {
++			/* Algorithm 2: protect W only while the gate is active. */
++			if (!folio_test_large(folio) &&
++			    pebs_demotion_blocked(folio_pfn(folio)))
++				goto activate_locked;
+ 			list_add(&folio->lru, &demote_folios);
+ 			folio_unlock(folio);
+ 			continue;
+diff --git a/mm/memory.c b/mm/memory.c
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -69,6 +69,7 @@
+ #include <linux/migrate.h>
+ #include <linux/string.h>
+ #include <linux/memory-tiers.h>
++#include <linux/pebs_page_hist.h>
+ #include <linux/debugfs.h>
+ #include <linux/userfaultfd_k.h>
+ #include <linux/dax.h>
+@@ -5590,6 +5591,11 @@
+ 					writable, &last_cpupid);
+ 	if (target_nid == NUMA_NO_NODE)
+ 		goto out_map;
++	/* Gate slow-to-fast promotion, leaving same-tier NUMA balancing alone. */
++	if (!folio_test_large(folio) && !node_is_toptier(nid) &&
++	    node_is_toptier(target_nid) &&
++	    pebs_promotion_blocked(folio_pfn(folio)))
++		goto out_map;
+ 	if (migrate_misplaced_folio_prepare(folio, vma, target_nid)) {
+ 		flags |= TNF_MIGRATE_FAIL;
+ 		goto out_map;
